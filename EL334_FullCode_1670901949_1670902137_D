@@ -1,0 +1,452 @@
+//**ส่วนที่ 1 กำหนดค่าคงที่**//
+#include "MK64F12.h" // เรียกใช้ไฟล์ Header ของไมโครคอนโทรลเลอร์
+#define MASK(x) (1UL << (x)) // สร้างบิตมาสก์โดยเลื่อนเลข 1 ไปยังตำแหน่งบิต x
+// - กำหนดขา 7 segment - //
+#define LATCH_PIN 23 // กำหนด PTB23 (D4) เป็นขา LATCH ของ 7-segment
+#define CLOCK_PIN 3 // กำหนด PTC3 (D7) เป็นขา CLOCK สำหรับส่งข้อมูล
+#define DATA_PIN 12 // กำหนด PTC12 (D8) เป็นขา DATA สำหรับส่งข้อมูล
+// - กำหนดขา Switch - //
+#define S1_PIN 3 // กำหนด PTB3 (A1) เป็นปุ่ม S1 สำหรับเริ่ม/ยืนยัน/เริ่มเกมใหม่
+#define SW2_PIN 10 // กำหนด PTB10 (A2) เป็นสวิตช์เพิ่มหลักสิบ
+#define SW3_PIN 11 // กำหนด PTB11 (A3) เป็นสวิตช์เพิ่มหลักหน่วย   
+// - กำหนดขา LED - //
+#define D1_PIN 1 // กำหนด PTD1 (D13) เป็น LED แจ้งว่าคำตอบมากกว่ามาก
+#define D2_PIN 3 // กำหนด PTD3 (D12) เป็น LED แจ้งว่าคำตอบมากกว่า
+#define D3_PIN 2 // กำหนด PTD2 (D11) เป็น LED แจ้งว่าคำตอบน้อยกว่า
+#define D4_PIN 0 // กำหนด PTD0 (D10) เป็น LED แจ้งว่าคำตอบน้อยกว่ามาก
+// - กำหนดขา Buzzer - //
+#define BUZZER_PIN 1 // กำหนด PTA1 (D3) เป็นขาควบคุม Buzzer
+
+//**ส่วนที่ 2 ประกาศตัวแปร Global**//
+// - ตัวแปรนับเวลา - //
+volatile uint32_t msTicks = 0; // ตัวนับเวลามิลลิวินาทีที่ถูกเปลี่ยนค่าใน interrupt จึงต้องใช้ volatile
+uint32_t lastTick = 0; // เก็บเวลาอ้างอิงล่าสุดสำหรับนับเวลาถอยหลังทีละวินาที
+uint32_t countdownStartTime = 0; // เก็บเวลาที่เริ่มเกมเพื่อคำนวณเวลาที่ผ่านไป
+// - ตัวแปรสถานะ Normal Buzzer  – //
+uint32_t buzzerStartTime = 0; // เก็บเวลาเริ่มส่งเสียงเตือนปกติ
+int buzzerActive = 0; // สถานะว่าเสียงเตือนปกติกำลังทำงานหรือไม่
+int buzzerStage = 0; // เก็บลำดับเสียงเตือนที่ทำไปแล้ว 
+// - ตัวแปรสถานะ Timeout Buzzer  – //
+uint32_t timeoutBuzzerStartTime = 0; // เก็บเวลาเริ่มเสียงเตือนเมื่อหมดเวลา
+int timeoutBuzzerActive = 0; // สถานะว่าเสียงเตือนหมดเวลากำลังทำงานหรือไม่
+// - ตัวแปรนับเวลา– //
+int timerRunning = 0;  // สถานะว่าตัวนับเวลาของเกมกำลังทำงานหรือไม่
+
+//**ส่วนที่ 3 ประกาศฟังก์ชัน**//
+// - ฟังก์ชันนับเวลา SysTick – //
+//เพิ่มค่าตัวแปร msTicks อัตโนมัติทุก ๆ 1 มิลลิวินาที สำหรับใช้จับเวลาการทำงานของระบบ
+void SysTick_Handler(void) {
+    msTicks++; // เพิ่มตัวนับเวลาขึ้น 1 มิลลิวินาที
+}
+
+// - ฟังก์ชันหน่วงเวลา – //
+//หน่วงเวลาการทำงานของโปรแกรมตามจำนวนมิลลิวินาทีที่กำหนด
+void delayMs(uint32_t n) {
+    uint32_t start = msTicks; // บันทึกเวลาปัจจุบันเป็นเวลาเริ่มหน่วง
+    while ((uint32_t)(msTicks - start) < n); // รอจนเวลาที่ผ่านไปครบตามที่กำหนด
+}
+
+// - ฟังก์ชันสุ่มเลข – //
+//สุ่มตัวเลขผสมค่ากับเวลา msTicks สำหรับใช้เป็นคำตอบของเกม
+uint32_t randomSeed = 12345; // กำหนดค่าเริ่มต้นสำหรับตัวสร้างเลขสุ่มเทียม
+unsigned char randomNumber(void) { // ฟังก์ชันสร้างและคืนค่าเลขสุ่ม
+    randomSeed = randomSeed * 1664525UL // คำนวณ seed ใหม่ด้วยสูตรสร้างเลขสุ่มเทียม
+               + 1013904223UL + msTicks; // บวกค่าคงที่และเวลาปัจจุบันเพื่อเปลี่ยน seed
+    return (randomSeed >> 16) % 100; // คืนค่าเลขในช่วง 0–99
+}
+
+// - ตารางรหัส segment สำหรับแสดงตัวเลข 0 ถึง 9 – //
+const unsigned char SEGMENT_MAP[] = {
+    0xC0, 0xF9, 0xA4, 0xB0, 0x99,
+    0x92, 0x82, 0xF8, 0x80, 0x90
+};
+
+// - ตารางรหัสเลือกเปิดใช้งาน segment แต่ละหลัก – //
+const unsigned char SEGMENT_SELECT[] = {
+    0xF1, 0xF2, 0xF4, 0xF8
+};
+
+// - ตารางรหัส segment แสดงคำว่า FAIL – //
+const unsigned char FAIL_MAP[] = {
+    0x8E, 0x88, 0xF9, 0xC7
+};
+
+// - ตารางรหัส segment แสดงคำว่า PASS – //
+const unsigned char PASS_MAP[] = {
+    0x8C, 0x88, 0x92, 0x92
+};
+
+// - ฟังก์ชันปิด LED – //
+//กำหนดให้ LED อยู่ในสถานะปิดทั้งหมด เพื่อเตรียมพร้อมสำหรับการแสดงคำใบ้ครั้งถัดไป
+void LED_off(void) {
+    PTD->PSOR = MASK(D1_PIN) | // เขียนค่า HIGH ไปยังขา GPIO ที่ระบุ
+                	MASK(D2_PIN) |
+                	MASK(D3_PIN) |
+             	MASK(D4_PIN);
+}
+
+// - ฟังก์ชันกำหนด GPIO – //
+//ตั้งค่าพอร์ตของ GPIO ที่ใช้กับ Push Button, 7 segment และ LED
+void GPIO_init(void) {
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | // เปิด clock ให้โมดูลพอร์ต A
+                  SIM_SCGC5_PORTB_MASK | // เปิด clock ให้โมดูลพอร์ต B
+                  SIM_SCGC5_PORTC_MASK | // เปิด clock ให้โมดูลพอร์ต C
+                  SIM_SCGC5_PORTD_MASK; // เปิด clock ให้โมดูลพอร์ต D
+
+    PORTA->PCR[BUZZER_PIN] = PORT_PCR_MUX(1); // กำหนดพอร์ต A ขา BUZZER_PIN เป็นโหมด GPIO  
+  
+    PORTB->PCR[LATCH_PIN] = PORT_PCR_MUX(1); // กำหนดพอร์ต B ขา LATCH_PIN เป็นโหมด GPIO
+    PORTC->PCR[CLOCK_PIN] = PORT_PCR_MUX(1); // กำหนดพอร์ต C ขา CLOCK_PIN เป็นโหมด GPIO
+    PORTC->PCR[DATA_PIN] = PORT_PCR_MUX(1); // กำหนดพอร์ต C ขา DATA_PIN เป็นโหมด GPIO
+
+    PORTB->PCR[S1_PIN] = PORT_PCR_MUX(1) | // กำหนดพอร์ต B ขา S1_PIN เป็นโหมด GPIO
+                         PORT_PCR_PE_MASK |
+                         PORT_PCR_PS_MASK;
+
+    PORTB->PCR[SW2_PIN] = PORT_PCR_MUX(1) | // กำหนดพอร์ต B ขา SW2_PIN เป็นโหมด GPIO
+                          PORT_PCR_PE_MASK |
+                          PORT_PCR_PS_MASK;
+    PORTB->PCR[SW3_PIN] = PORT_PCR_MUX(1) | // กำหนดพอร์ต B ขา SW3_PIN เป็นโหมด GPIO
+                          PORT_PCR_PE_MASK |
+                          PORT_PCR_PS_MASK;
+
+    PORTD->PCR[D1_PIN] = PORT_PCR_MUX(1); // กำหนดพอร์ต D ขา D1_PIN เป็นโหมด GPIO
+    PORTD->PCR[D2_PIN] = PORT_PCR_MUX(1); // กำหนดพอร์ต D ขา D2_PIN เป็นโหมด GPIO
+    PORTD->PCR[D3_PIN] = PORT_PCR_MUX(1); // กำหนดพอร์ต D ขา D3_PIN เป็นโหมด GPIO
+    PORTD->PCR[D4_PIN] = PORT_PCR_MUX(1); // กำหนดพอร์ต D ขา D4_PIN เป็นโหมด GPIO
+
+    PTA->PDDR &= ~MASK(BUZZER_PIN); // กำหนดพอร์ต A ขา BUZZER_PIN เป็น Input เพื่อปิด Buzzer
+    PTB->PDDR |= MASK(LATCH_PIN); // กำหนดพอร์ต B ขา LATCH_PIN เป็น Output
+    PTB->PDDR &= ~(MASK(S1_PIN) | // กำหนดพอร์ต B ขา S1_PIN เป็น Input
+                   MASK(SW2_PIN) | // กำหนดพอร์ต B ขา SW2_PIN เป็น Input
+                   MASK(SW3_PIN)); // กำหนดพอร์ต B ขา SW3_PIN เป็น Input
+    PTC->PDDR |= MASK(CLOCK_PIN) | // กำหนดพอร์ต C ขา CLOCK_PIN เป็น Output
+                 MASK(DATA_PIN); // กำหนดพอร์ต C ขา DATA_PIN เป็น Output
+    PTD->PDDR |= MASK(D1_PIN) | // กำหนดพอร์ต D ขา D1_PIN เป็น Output
+                 MASK(D2_PIN) | // กำหนดพอร์ต D ขา D2_PIN เป็น Output
+                 MASK(D3_PIN) | // กำหนดพอร์ต D ขา D3_PIN เป็น Output
+                 MASK(D4_PIN); // กำหนดพอร์ต D ขา D4_PIN เป็น Output
+
+    PTB->PCOR = MASK(LATCH_PIN); // กำหนดพอร์ต B ขา LATCH_PIN ให้เป็น LOW
+    PTC->PCOR = MASK(CLOCK_PIN) | // กำหนดพอร์ต C ขา CLOCK_PIN ให้เป็น LOW
+                MASK(DATA_PIN); // กำหนดพอร์ต C ขา DATA_PIN ให้เป็น LOW
+    LED_off(); // เรียกใช้ฟังก์ชันปิด LED
+}
+
+// - ฟังก์ชันเปิด Buzzer – //
+void Buzzer_ON(void) {
+    PTA->PCOR = MASK(BUZZER_PIN); // กำหนดพอร์ต A ขา BUZZER_PIN ให้เป็น LOW
+    PTA->PDDR |= MASK(BUZZER_PIN); // กำหนดพอร์ต A ขา BUZZER_PIN เป็น Output เพื่อเปิด Buzzer
+}
+
+// - ฟังก์ชันปิด Buzzer – //
+void Buzzer_OFF(void) {
+    PTA->PDDR &= ~MASK(BUZZER_PIN); // กำหนดพอร์ต A ขา BUZZER_PIN เป็น Input เพื่อปิด Buzzer
+}
+
+// - ฟังก์ชันตรวจสอบเวลาที่เหลือ – //
+//ตรวจสอบเวลาที่เหลือและควบคุมการส่งเสียงเตือน
+void Buzzer_Update(void) {
+    uint32_t currentTime = msTicks; // อ่านเวลาปัจจุบันจากตัวนับ SysTick
+    uint32_t elapsedTime = // ประกาศตัวแปรเก็บเวลาที่ผ่านไปตั้งแต่เริ่มเกม
+        (uint32_t)(currentTime - countdownStartTime); // คำนวณเวลาที่ผ่านไปตั้งแต่เริ่มนับถอยหลัง
+
+    if (buzzerActive) {  // ปิดเสียง Buzzer เมื่อผ่านไป 0.2 วินาที (200 ms)
+        if ((uint32_t)(currentTime - buzzerStartTime) >= 200U) { // ถ้าเวลาผ่านไปมากกว่าเท่ากับ 0.2 วินาที
+            Buzzer_OFF(); // เรียกใช้ฟังก์ชันปิด Buzzer
+            buzzerActive = 0; // สถานะ Buzzer ไม่ทำงาน
+        }
+    }
+// เปิดเสียง Buzzer เวลา 30 20 10 3 2 1 วินาที
+    if (!buzzerActive && buzzerStage < 6) { // ถ้า Buzzer ทำงานและส่งเสียงเตือนน้อยกว่า 6 ครั้ง
+        if ((buzzerStage == 0 && elapsedTime >= 30000U) || // ถ้า Buzzer ส่งเสียงเตือน 0 ครั้งและเวลามากกว่าเท่ากับ 30 วินาที
+            (buzzerStage == 1 && elapsedTime >= 40000U) || // ถ้า Buzzer ส่งเสียงเตือน 1 ครั้งและเวลามากกว่าเท่ากับ 20 วินาที
+            (buzzerStage == 2 && elapsedTime >= 50000U) || // ถ้า Buzzer ส่งเสียงเตือน 2 ครั้งและเวลามากกว่าเท่ากับ 10 วินาที
+            (buzzerStage == 3 && elapsedTime >= 57000U) || // ถ้า Buzzer ส่งเสียงเตือน 3 ครั้งและเวลามากกว่าเท่ากับ 3 วินาที
+            (buzzerStage == 4 && elapsedTime >= 58000U) || // ถ้า Buzzer ส่งเสียงเตือน 4 ครั้งและเวลามากกว่าเท่ากับ 2 วินาที
+            (buzzerStage == 5 && elapsedTime >= 59000U)) { // ถ้า Buzzer ส่งเสียงเตือน 5 ครั้งและเวลามากกว่าเท่ากับ 1 วินาที
+            Buzzer_ON(); // เรียกใช้ฟังก์ชันเปิด Buzzer
+            buzzerActive = 1; // สถานะ Buzzer ทำงาน
+            buzzerStartTime = currentTime; // เวลาปัจจุบันเท่ากับเวลาเริ่มส่งเสียง
+            buzzerStage++; // เพิ่มรอบการส่งเสียง
+        }
+    }
+}
+
+// - ฟังก์ชันแสดงคำใบ้ LED – //
+//คำนวณผลต่างระหว่างค่าที่ผู้เล่นตอบกับค่าที่ระบบสุ่ม แล้วเปิด LED ตามเงื่อนไข
+void LED_hint(int answer, int target) {
+    int difference = answer - target; // คำนวณผลต่างของคำตอบกับเลขเป้าหมาย
+    LED_off(); // เรียกใช้ฟังก์ชันปิด LED
+    if (difference >= 10) { // ถ้าผลต่างของคำตอบมากกว่าเท่ากับ 10 = มากกว่ามาก
+        PTD->PCOR = MASK(D1_PIN); // กำหนดพอร์ต D ขา D1_PIN ให้เป็น LOW เพื่อเปิดไฟ D1
+    }
+    else if (difference > 0) { // ถ้าผลต่างของคำตอบมากกว่า 0 = มากกว่า
+        PTD->PCOR = MASK(D2_PIN); // กำหนดพอร์ต D ขา D2_PIN ให้เป็น LOW เพื่อเปิดไฟ D2
+    }
+    else if (difference <= -10) { // ถ้าผลต่างของคำตอบน้อยกว่าเท่ากับ -10 = น้อยกว่ามาก
+        PTD->PCOR = MASK(D4_PIN); // กำหนดพอร์ต D ขา D4_PIN ให้เป็น LOW เพื่อเปิดไฟ D4
+    }
+    else if (difference < 0) { // ถ้าผลต่างของคำตอบน้อยกว่า 0 = น้อยกว่า
+        PTD->PCOR = MASK(D3_PIN); // กำหนดพอร์ต D ขา D3_PIN ให้เป็น LOW เพื่อเปิดไฟ D3
+    }
+}
+
+// - ฟังก์ชัน Shift Out – //
+//ส่งข้อมูล 8 บิตไป 7 segment แบบอนุกรม
+void shiftOut(unsigned char data) {
+    int i; // ตัวแปรนับตำแหน่งบิตที่กำลังส่ง
+    for (i = 7; i >= 0; i--) { // วนทำงานตามเงื่อนไขและจำนวนรอบที่กำหนด
+        if (data & MASK(i))
+            PTC->PSOR = MASK(DATA_PIN); // กำหนดพอร์ต C ขา DATA_PIN ให้เป็น HIGH
+        else
+            PTC->PCOR = MASK(DATA_PIN); // กำหนดพอร์ต C ขา DATA_PIN ให้เป็น LOW
+        PTC->PSOR = MASK(CLOCK_PIN); // กำหนดพอร์ต C ขา CLOCK_PIN ให้เป็น HIGH
+        PTC->PCOR = MASK(CLOCK_PIN); // กำหนดพอร์ต C ขา CLOCK_PIN ให้เป็น LOW
+    }
+}
+
+// - ฟังก์ชัน Write Pattern Digit – //
+//แสดงรูปแบบข้อมูลที่กำหนดไปบนหลักของ 7 Segment ที่เลือก
+void writePatternDigit(unsigned char digitIndex,
+                       unsigned char pattern) { // รับรหัสรูปแบบ segment ที่ต้องการแสดง
+    PTB->PCOR = MASK(LATCH_PIN); // กำหนดพอร์ต B ขา LATCH_PIN ให้เป็น LOW
+    shiftOut(pattern); // เรียกใช้ฟังก์ชัน Shift Out ผ่านพารามิเตอร์ pattern
+    shiftOut(SEGMENT_SELECT[digitIndex]); // เรียกใช้ฟังก์ชัน Shift Out เพื่อเลือกหลักผ่านพารามิเตอร์ digitIndex
+    PTB->PSOR = MASK(LATCH_PIN); // กำหนดพอร์ต B ขา LATCH_PIN ให้เป็น HIGH
+    delayMs(2); // เรียกใช้ฟังก์ชันหน่วงเวลา 2 วินาที
+}
+
+// - ฟังก์ชัน Write Digit – //
+//แสดงตัวเลข 0 ถึง 9 บน 7 Segment
+void writeDigit(unsigned char digitIndex,
+                unsigned char value) { // รับค่าตัวเลขที่ต้องการแสดง
+    writePatternDigit(digitIndex, // เรียกใช้ฟังก์ชัน Write Pattern Digit ผ่าน digitIndex 
+                      SEGMENT_MAP[value]); //เรียกใช้ SEGMENT_MAP เพื่อเลือกตัวเลขที่จะแสดง
+}
+
+// - ฟังก์ชัน Display Number – //
+//แสดงตัวเลข 4 หลักบน 7 Segment
+void displayNumber(unsigned char d0, // รับค่าตัวเลขหลักที่ 1
+                   unsigned char d1, // รับค่าตัวเลขหลักที่ 2
+                   unsigned char d2, // รับค่าตัวเลขหลักที่ 3
+                   unsigned char d3) { // รับค่าตัวเลขหลักที่ 4
+    writeDigit(0, d0); // เรียกใช้ฟังก์ชัน Write Digit ที่หลัก 1
+    writeDigit(1, d1); // เรียกใช้ฟังก์ชัน Write Digit ที่หลัก 2
+    writeDigit(2, d2); // เรียกใช้ฟังก์ชัน Write Digit ที่หลัก 3
+    writeDigit(3, d3); // เรียกใช้ฟังก์ชัน Write Digit ที่หลัก 4
+}
+
+// - ฟังก์ชัน Display Answer – //
+//แสดงจำนวนครั้งที่ตอบผิด (หลักที่ 1 – 2) และค่าตัวเลขที่ผู้เล่นกำลังเลือก (หลักที่ 3 - 4)
+void displayAnswer(unsigned char wrongCount, // นับจำนวนครั้งที่ตอบผิด
+                   unsigned char tens, // รับค่าหลักสิบของคำตอบ
+                   unsigned char units) { // รับค่าหลักหน่วยของคำตอบ
+    writeDigit(0, wrongCount / 10); // เรียกใช้ฟังก์ชัน Write Digit ที่หลัก 1
+    writeDigit(1, wrongCount % 10); // เรียกใช้ฟังก์ชัน Write Digit ที่หลัก 2
+    writeDigit(2, tens); // เรียกใช้ฟังก์ชัน Write Digit ที่หลัก 3
+    writeDigit(3, units); // เรียกใช้ฟังก์ชัน Write Digit ที่หลัก 4
+}
+
+// - ฟังก์ชัน Display FAIL – //
+//แสดงข้อความ FAIL บน 7 Segment
+void displayFail(void) {
+    writePatternDigit(0, FAIL_MAP[0]); // เรียกใช้ฟังก์ชัน Write Pattern Digit พร้อมข้อมูลจาก FAIL_MAP ตำแหน่ง 0
+    writePatternDigit(1, FAIL_MAP[1]); // เรียกใช้ฟังก์ชัน Write Pattern Digit พร้อมข้อมูลจาก FAIL_MAP ตำแหน่ง 1
+    writePatternDigit(2, FAIL_MAP[2]); // เรียกใช้ฟังก์ชัน Write Pattern Digit พร้อมข้อมูลจาก FAIL_MAP ตำแหน่ง 2
+    writePatternDigit(3, FAIL_MAP[3]); // เรียกใช้ฟังก์ชัน Write Pattern Digit พร้อมข้อมูลจาก FAIL_MAP ตำแหน่ง 3
+}
+
+// - ฟังก์ชัน Display PASS – //
+//แสดงข้อความ PASS บน 7 Segment
+void displayPass(void) {
+    writePatternDigit(0, PASS_MAP[0]); // เรียกใช้ฟังก์ชัน Write Pattern Digit พร้อมข้อมูลจาก PASS_MAP ตำแหน่ง 0
+    writePatternDigit(1, PASS_MAP[1]); // เรียกใช้ฟังก์ชัน Write Pattern Digit พร้อมข้อมูลจาก PASS_MAP ตำแหน่ง 1
+    writePatternDigit(2, PASS_MAP[2]); // เรียกใช้ฟังก์ชัน Write Pattern Digit พร้อมข้อมูลจาก PASS_MAP ตำแหน่ง 2
+    writePatternDigit(3, PASS_MAP[3]); // เรียกใช้ฟังก์ชัน Write Pattern Digit พร้อมข้อมูลจาก PASS_MAP ตำแหน่ง 3
+}
+
+//**ส่วนที่ 4 Main Program**//
+// - ฟังก์ชัน Main – //
+//เป็นฟังก์ชันหลักของโปรแกรม ทำหน้าที่ควบคุมลำดับการทำงานทั้งหมดของเกม
+int main(void) {
+    unsigned char tens = 0; // ประกาศตัวแปรจำนวนเต็มไม่ติดลบเพื่อเก็บข้อมูลหลักสิบ
+    unsigned char units = 0; // ประกาศตัวแปรจำนวนเต็มไม่ติดลบเพื่อเก็บข้อมูลหลักหน่วย
+    unsigned char randomValue = 0; // ประกาศตัวแปรจำนวนเต็มไม่ติดลบเพื่อเก็บข้อมูลกรสุ่มเลข
+    unsigned char timer = 0; // ประกาศตัวแปรจำนวนเต็มไม่ติดลบเพื่อเก็บข้อมูลเวลา
+    unsigned char wrongCount = 0; // ประกาศตัวแปรจำนวนเต็มไม่ติดลบเพื่อเก็บข้อมูลจำนวนที่ตอบผิด
+    int gameStarted = 0; // ประกาศตัวแปรจำนวนเต็มเพื่อเก็บสถานะการเริ่มเกม
+    int gameFinished = 0; // ประกาศตัวแปรจำนวนเต็มเพื่อเก็บสถานะการจบเกม
+    int passed = 0; // ประกาศตัวแปรจำนวนเต็มเพื่อเก็บสถานะการชนะ
+    int s1Prev = 1; // ประกาศตัวแปรจำนวนเต็มเพื่อเก็บสถานะปุ่ม S1
+    int sw2Prev = 1; // ประกาศตัวแปรจำนวนเต็มเพื่อเก็บสถานะปุ่ม SW2
+    int sw3Prev = 1; // ประกาศตัวแปรจำนวนเต็มเพื่อเก็บสถานะปุ่ม SW3
+    int answer; // ประกาศตัวแปรจำนวนเต็มเพื่อเก็บคำตอบ
+
+    GPIO_init(); // เรียกใช้ฟังก์ชัน GPIO_init() เพื่อตั้งค่า GPIO ทั้งหมด
+
+    SysTick_Config(SystemCoreClock / 1000U); // ตั้ง SysTick ให้ interrupt ทุก 1 มิลลิวินาที
+
+    while (1) {
+// การแสดงผลของเกม
+        if (gameFinished) { // ตรวจว่าเกมจบแล้วหรือไม่
+            if (passed) // ถ้าชนะ
+                displayPass(); // เรียกใช้ฟังก์ชัน displayPass() เพื่อแสดงข้อความ PASS
+            else // ถ้าแพ้
+                displayFail(); // เรียกใช้ฟังก์ชัน displayFail() เพื่อแสดงข้อความ FAIL
+        }
+        else if (gameStarted) { // ถ้าเกมกำลังเล่น
+            displayAnswer(wrongCount, tens, units); // เรียกใช้ฟังก์ชัน displayAnswer เพื่อแสดงจำนวนครั้งที่ตอบผิดและตัวเลขคำตอบปัจจุบัน
+        }
+        else { // ถ้าเกมยังไม่เริ่ม
+            displayNumber(0, 0, 0, 0); // เรียกใช้ฟังก์ชัน displayNumber เพื่อแสดง 0000 เมื่อเกมยังไม่เริ่ม
+        }
+
+// ตรวจสอบการกดของปุ่ม S1
+        if (!(PTB->PDIR & MASK(S1_PIN)) && s1Prev) { // ตรวจสอบว่าปุ่มถูกกดหรือไม่ // ถ้าไม่ได้กด = 1 เพราะใช้ Pull-up Resistor // ถ้ากด = 0
+            delayMs(20); // เรียกใช้ฟังก์ชันหน่วงเวลาเพื่อรอสัญญาณนิ่ง
+            if (!(PTB->PDIR & MASK(S1_PIN))) { // ตรวจสอบว่าปุ่มถูกกดหรือไม่อีกครั้ง
+
+	// สถานะเริ่มเกมใหม่ของปุ่ม S1
+                if (gameFinished) { // ตรวจว่าเกมจบแล้วหรือไม่ ถ้าจบจะ Restart เกมใหม่
+                    gameFinished = 0; // กำหนดสถานะเกมยังไม่จบ
+                    gameStarted = 0; // กำหนดสถานะเกมยังไม่เริ่ม
+                    passed = 0; // กำหนดสถานะเกมยังไม่ชนะ
+                    tens = 0; // กำหนดคำตอบหลักสิบเป็น 0
+                    units = 0; // กำหนดคำตอบหลักหน่วยเป็น 0
+                    wrongCount = 0; // กำหนดจำนวนคำตอบที่ผิดเป็น 0
+                    timer = 0; // กำหนดเวลาเป็น 0
+                    timerRunning = 0; // กำหนดเวลาที่กำลังนับเป็น 0
+                    buzzerActive = 0; // ปิดสถานะการทำงาน Buzzer 
+                    buzzerStage = 0; // กำหนดจำนวนครั้งที่ Buzzer แจ้งเตือนเป็น 0
+                    timeoutBuzzerActive = 0; // กำหนดเวลาที่เวลา Buzzer จะเหลือการทำงานเป็น 0
+
+                    Buzzer_OFF(); // เรียกใช้ฟังก์ชันปิด Buzzer
+                    LED_off(); // เรียกใช้ฟังก์ชันปิด LED
+                }
+	
+    // สถานะเริ่มเกมของปุ่ม S1
+                else if (!gameStarted) { // ถ้าเริ่มเกม
+                    randomValue = randomNumber(); // สุ่มเลขเป้าหมายใหม่ตั้งแต่ 0 ถึง 99
+                    timer = 60; // ตั้งเวลาของเกมไว้ 60 วินาที
+                    tens = 0; // กำหนดคำตอบหลักสิบเป็น 0
+                    units = 0; // กำหนดคำตอบหลักหน่วยเป็น 0
+                    wrongCount = 0; // กำหนดจำนวนคำตอบที่ผิดเป็น 0
+                    gameStarted = 1; // กำหนดสถานะเกมเริ่ม
+                    timerRunning = 1; // กำหนดเวลาเริ่มนับ
+                    buzzerActive = 0; // ปิดสถานะการทำงาน Buzzer
+                    buzzerStage = 0; // กำหนดจำนวนครั้งที่ Buzzer แจ้งเตือนเป็น 0
+                    timeoutBuzzerActive = 0; // กำหนดเวลาที่เวลา Buzzer จะเหลือการทำงานเป็น 0
+
+                    Buzzer_OFF(); // เรียกใช้ฟังก์ชันปิด Buzzer
+                    LED_off(); // เรียกใช้ฟังก์ชันปิด LED
+
+                    lastTick = msTicks; // กำหนดเวลาอ้างอิงล่าสุดสำหรับนับเวลาถอยหลังเท่ากับ msTicks
+                    countdownStartTime = msTicks; // กำหนดเวลาที่เริ่มเกมเท่ากับ msTicks
+                }
+
+	// สถานะยืนยันคำตอบของปุ่ม S1
+                else {
+                    answer = tens * 10 + units; // รวมหลักสิบและหลักหน่วยเป็นคำตอบจำนวน 0–99
+                    if (answer == randomValue) { // ถ้าคำตอบตรงกับตัวเลขที่สุ่มไว้
+                        passed = 1; // กำหนดสถานะเกมชนะ
+                        gameStarted = 0; // กำหนดสถานะเกมยังไม่เริ่ม
+                        gameFinished = 1; // กำหนดสถานะเกมจบ
+                        timerRunning = 0; // กำหนดเวลาที่กำลังนับเป็น 0
+                        buzzerActive = 0; // ปิดสถานะการทำงาน Buzzer
+                        timeoutBuzzerActive = 0; // กำหนดเวลาที่เวลา Buzzer จะเหลือการทำงานเป็น 0
+
+                        Buzzer_OFF(); // เรียกใช้ฟังก์ชันปิด Buzzer
+                        LED_off(); // เรียกใช้ฟังก์ชันปิด LED
+                    }
+                    else { // ถ้าคำตอบไม่ตรงกับตัวเลขที่สุ่มไว้
+                        if (wrongCount < 99) { // ถ้าจำนวนคำตอบที่ตอบผิดน้อยกว่า 90
+                            wrongCount++; // เพิ่มจำนวนคำตอบที่ตอบผิด
+                        }
+                        LED_hint(answer, randomValue); // เรียกใช้ฟังก์ชัน LED_hint เพื่อแสดงคำใบ้
+                    }
+                }
+            }
+            s1Prev = 0; // ป้องกันการอ่านค่าซ้ำเมื่อกดค้าง
+        }
+
+// ตรวจสอบการปล่อยของปุ่ม S1
+        if (PTB->PDIR & MASK(S1_PIN)) { // ค่า Input จะกลับเป็น 1
+            s1Prev = 1; // เพื่อให้พร้อมการตรวจสอบครั้งใหม่
+        }
+
+// ตรวจสอบการกดของปุ่ม SW3 (หลักหน่วย)
+        if (!(PTB->PDIR & MASK(SW3_PIN)) && sw3Prev) { // ตรวจสอบว่าปุ่มถูกกดหรือไม่ // ถ้าไม่ได้กด = 1 เพราะใช้ Pull-up Resistor // ถ้ากด = 0
+            delayMs(20); // เรียกใช้ฟังก์ชันหน่วงเวลาเพื่อรอสัญญาณนิ่ง
+            if (!(PTB->PDIR & MASK(SW3_PIN)) && gameStarted) { // ตรวจสอบว่าปุ่มถูกกดหรือไม่อีกครั้งและเกมเริ่ม
+                units++; // เพิ่มค่าตัวแปรหลักหน่วย
+                if (units > 9) { // ถ้าค่าตัวแปรหลักหน่วยมากกว่า 9
+                    units = 0; // กำหนดค่าตัวแปรหลักหน่วยเท่ากับ 0
+                }
+            }
+            sw3Prev = 0; // ป้องกันการอ่านค่าซ้ำเมื่อกดค้าง
+        }
+
+// ตรวจสอบการปล่อยของปุ่ม SW3 (หลักหน่วย)
+        if (PTB->PDIR & MASK(SW3_PIN)) { // ค่า Input จะกลับเป็น 1
+            sw3Prev = 1; // เพื่อให้พร้อมการตรวจสอบครั้งใหม่
+        }
+
+// ตรวจสอบการกดของปุ่ม SW2 (หลักสิบ)
+        if (!(PTB->PDIR & MASK(SW2_PIN)) && sw2Prev) {// ตรวจสอบว่าปุ่มถูกกดหรือไม่ // ถ้าไม่ได้กด = 1 เพราะใช้ Pull-up Resistor // ถ้ากด = 0
+            delayMs(20); // เรียกใช้ฟังก์ชันหน่วงเวลาเพื่อรอสัญญาณนิ่ง
+            if (!(PTB->PDIR & MASK(SW2_PIN)) && gameStarted) { // ตรวจสอบว่าปุ่มถูกกดหรือไม่อีกครั้งและเกมเริ่ม
+                tens++; // เพิ่มค่าตัวแปรหลักสิบ
+                if (tens > 9) { // ถ้าค่าตัวแปรสิบหน่วยมากกว่า 9
+                    tens = 0; // กำหนดค่าตัวแปรสิบหน่วยเท่ากับ 0
+                }
+            }
+            sw2Prev = 0; // ป้องกันการอ่านค่าซ้ำเมื่อกดค้าง
+        }
+        
+// ตรวจสอบการปล่อยของปุ่ม SW2 (หลักสิบ)
+        if (PTB->PDIR & MASK(SW2_PIN)) { // ค่า Input จะกลับเป็น 1
+            sw2Prev = 1; // เพื่อให้พร้อมการตรวจสอบครั้งใหม่
+        }
+
+// นับถอยหลัง 60 วินาที
+        if (timerRunning) { // ถ้ามีการนับเวลาอยู่
+            while ((uint32_t)(msTicks - lastTick) >= 1000U) { // เมื่อผ่านไปครบ 1 วินาที
+                lastTick += 1000U; // เพิ่มเวลาอ้างอิง 1 วินาที
+                if (timer > 0) { // ถ้าเวลาที่นับเหลือน้อยกว่า 0
+                    timer--; // ลดเวลาคงเหลือลง 1 วินาที
+                }
+
+                if (timer == 0) { // ถ้าหมดเวลา
+                    timerRunning = 0; // กำหนดเวลาที่กำลังนับเป็น 0
+                    gameStarted = 0; // กำหนดสถานะเกมยังไม่เริ่ม
+                    gameFinished = 1; // กำหนดสถานะเกมจบ
+                    passed = 0; // กำหนดสถานะเกมยังไม่ชนะ
+                    buzzerActive = 0; // ปิดสถานะการทำงาน Buzzer
+
+                    Buzzer_ON(); // เรียกใช้ฟังก์ชันเปิด Buzzer
+
+                    timeoutBuzzerActive = 1; // กำหนดสถานะ Buzzer หมดเวลา
+
+                    timeoutBuzzerStartTime = msTicks; // กำหนดให้สถานะแจ้งเตือนหมดเวลาเท่ากับ msTicks
+
+                    LED_off(); // เรียกใช้ฟังก์ชันปิด LED
+                    break; // ออกจากการทำงาน
+                }
+            }
+
+// ตรวจสอบเวลาที่เหลือ
+            if (timerRunning) { // ถ้ามีการนับเวลาอยู่
+                Buzzer_Update();// เรียกใช้ฟังก์ชันอัปเดตเสียงเตือนตามช่วงเวลาที่กำหนด
+            }
+        }
+        
+// ตรวจว่าเสียงเตือนเมื่อหมดเวลากำลังทำงานหรือไม่
+        if (timeoutBuzzerActive) { // ถ้าเสียงเตือนเมื่อหมดเวลากำลังทำงาน
+            if ((uint32_t)(msTicks - timeoutBuzzerStartTime) >= 1000U) { // ตรวจว่าเสียงเตือนหมดเวลาดังครบ 1 วินาทีหรือยัง
+                Buzzer_OFF(); // เรียกใช้ฟังก์ชันปิด Buzzer
+                timeoutBuzzerActive = 0; // กำหนดสถานะ Buzzer หมดเวลา
+            }
+        }
+    }
+}
